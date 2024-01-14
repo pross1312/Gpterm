@@ -1,4 +1,6 @@
 mod gpt;
+mod buffer;
+use buffer::Buffer;
 use std::fs::File;
 use std::io::{Write};
 use std::time::Duration;
@@ -6,17 +8,17 @@ use std::sync::mpsc::{self};
 use std::{io::{self}, thread};
 use crossterm::{
     QueueableCommand,
-    terminal::{self, ClearType}, cursor::{self}, style::{self}, event::{self, KeyCode, KeyModifiers}
+    terminal, style, event::{self, KeyCode, KeyModifiers}, cursor
 };
 use serde::de::Visitor;
 
 const AI_COLOR: style::Color = style::Color::Blue;
+const INPUT_COLOR: style::Color = style::Color::White;
 const SYSTEM_COLOR: style::Color = style::Color::Red;
 const USER_COLOR: style::Color = style::Color::Green;
-const SCROLL_SPEED: usize = 2; // lines
+const SCROLL_SPEED: usize = 3; // lines
 const CONV_FILE: &str = "conversation.json";
 const START_PREFIX: &str = "■  ";
-
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Role {
@@ -48,6 +50,8 @@ impl serde::Serialize for Role {
         serializer.serialize_str(self.value())
     }
 }
+
+
 impl Role {
     fn from(str: &str) -> Option<Self> {
         match str.to_lowercase().as_str() {
@@ -90,10 +94,11 @@ fn split_by_length(mut str: &str, length: usize) -> Vec<&str> {
     return result;
 }
 
-fn render_conversation(state: &mut State, stdout: &mut io::Stdout,
-                       row: u16, height: u16, width: u16) -> io::Result<()>{
+fn render_conversation(state: &mut State, buffer: &mut Buffer,
+                       row: usize, height: usize, width: usize) {
     let mut cur_row = row;
     let mut current_role = &Role::AI;
+    let mut current_color = AI_COLOR;
     let conv = state.conv.iter().rev();
     let conv_iter = conv.flat_map(|(role, content)| {
         let mut lines = content.rsplit("\n")
@@ -115,39 +120,26 @@ fn render_conversation(state: &mut State, stdout: &mut io::Stdout,
     for (is_first, role, content) in conv_iter.skip(state.view_start) {
         if current_role != role { // NOTE: switch role or first line
             current_role = role;
-            stdout.queue(style::SetForegroundColor(match *current_role {
+            current_color = match *current_role {
                 Role::AI => AI_COLOR,
                 Role::User => USER_COLOR,
                 Role::System => SYSTEM_COLOR,
-            }))?;
+            }
         }
-        stdout.queue(cursor::MoveTo(0, cur_row))?;
-        if is_first { stdout.queue(style::Print(START_PREFIX))?; }
-        stdout.queue(style::Print(content))?;
+        if is_first {
+            buffer.render_line(cur_row, current_color, &format!("{START_PREFIX}{content}"));
+        } else {
+            buffer.render_line(cur_row, current_color, content);
+        };
         if cur_row == 0 { break; }
         cur_row -= 1;
     }
-    Ok(())
 }
 
-fn render_seperator(stdout: &mut io::Stdout, row: u16, width: u16) -> io::Result<()> {
-    stdout.queue(style::SetForegroundColor(style::Color::Reset))?
-          .queue(cursor::MoveTo(0, row))?
-          .queue(style::Print(&"—".repeat(width as usize)))?;
-    Ok(())
-}
-
-fn render_prompt(input: &String, stdout: &mut io::Stdout, row: u16) -> io::Result<()> {
-    stdout.queue(cursor::MoveTo(0, row))?
-          .queue(style::Print(input))?;
-    Ok(())
-}
-
-fn render(state: &mut State, stdout: &mut io::Stdout, width: u16, height: u16) -> io::Result<()> {
-    stdout.queue(terminal::Clear(ClearType::All))?;
-    render_conversation(state, stdout, height-3, height - 2, width)?;
-    render_seperator(stdout, height-2, width)?;
-    render_prompt(&state.input, stdout, height-1)?;
+fn render(state: &mut State, buffer: &mut Buffer) -> io::Result<()> {
+    render_conversation(state, buffer, buffer.height-3, buffer.height - 2, buffer.width);
+    buffer.render_line(buffer.height-2, style::Color::Reset, &"—".repeat(buffer.width as usize));
+    buffer.render_line(buffer.height-1, INPUT_COLOR, &state.input);
     Ok(())
 }
 
@@ -174,21 +166,33 @@ fn main() -> io::Result<()> {
         Ok(conv) => state.conv = conv,
         Err(err) => {state.append_conv(Role::System, err)}
     }
-    let (width, height) = terminal::size().unwrap();
+    let size = terminal::size().unwrap();
+    let width = size.0 as usize;
+    let height = size.1 as usize;
+    let mut buffers = [Buffer::new(width, height), Buffer::new(width, height)];
+    let mut rendering_buf = 0;
     let (tx, rx) = mpsc::channel();
 
-    stdout.queue(crossterm::event::EnableMouseCapture).unwrap();
-    stdout.queue(terminal::Clear(terminal::ClearType::All))?;
+    // stdout.queue(crossterm::event::EnableMouseCapture).unwrap();
+    stdout.queue(terminal::Clear(terminal::ClearType::All)).unwrap();
     'main: loop {
+        buffers[rendering_buf].clear();
         while event::poll(Duration::ZERO)? {
             match event::read()? {
                 event::Event::Key(key) => {
                     match key.code {
                         KeyCode::Char(c) => {
-                            if c == 'c' && key.modifiers == KeyModifiers::CONTROL {
-                                break 'main;
-                            }
-                            state.input.push(c);
+                            match key.modifiers {
+                                KeyModifiers::CONTROL => match c {
+                                    'c' => break 'main,
+                                    'p' => state.view_start += SCROLL_SPEED,
+                                    'n' => if state.view_start >= SCROLL_SPEED { state.view_start -= SCROLL_SPEED; },
+                                    _ => {}
+                                },
+                                KeyModifiers::SHIFT => state.input.push(c),
+                                KeyModifiers::NONE => state.input.push(c),
+                                _ => {}
+                            };
                         }
                         KeyCode::Enter => {
                             if state.input.len() > 0 {
@@ -206,7 +210,13 @@ fn main() -> io::Result<()> {
                         }
                         KeyCode::Backspace => {
                             if state.input.len() > 0 {
-                                state.input.pop();
+                                if key.modifiers == KeyModifiers::ALT {
+                                    let new_len = state.input.trim_end_matches(|x: char| x.is_alphanumeric())
+                                                             .trim_end().len();
+                                    state.input.truncate(new_len);
+                                } else {
+                                    state.input.pop();
+                                }
                             }
                         }
                         _ => {}
@@ -235,13 +245,19 @@ fn main() -> io::Result<()> {
                     state.append_conv(Role::from(role).unwrap(), String::new());
                 } else {
                     state.conv.last_mut().unwrap().1.push_str(&content);
+                    state.view_start = 0;
                 }
             }
             Err(_err) => {}
         }
-        render(&mut state, &mut stdout, width, height)?;
+
+        render(&mut state, &mut buffers[rendering_buf])?;
+        buffers[1-rendering_buf].render_diff(&buffers[rendering_buf], &mut stdout)?;
+        stdout.queue(cursor::MoveTo(state.input.len() as u16, height as u16 - 1))?;
         stdout.flush()?;
         thread::sleep(Duration::from_millis(1000/60));
+
+        rendering_buf = 1 - rendering_buf;
     }
     terminal::disable_raw_mode()
 }
