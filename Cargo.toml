@@ -1,5 +1,5 @@
 [package]
-name = "gptermial"
+name = "gpterm"
 version = "0.1.0"
 edition = "2021"
 
@@ -11,5 +11,5 @@ openssl = "0.10.62"
 serde_json = "1.0.111"
 
 [[bin]]
-name = "gptermial"
+name = "gpterm"
 path = "main.rs"

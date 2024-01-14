@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fs::File;
 use std::net::TcpStream;
 use std::io::{Write, Read};
 use std::time::Duration;
@@ -12,14 +13,20 @@ use crossterm::{
 };
 
 const AI_COLOR: style::Color = style::Color::Blue;
+const SYSTEM_COLOR: style::Color = style::Color::Red;
 const USER_COLOR: style::Color = style::Color::Green;
 const SCROLL_SPEED: usize = 2; // lines
+const CONV_FILE: &str = "conversation.json";
+const START_PREFIX: &str = "■  ";
+const CHAT_MODEL: &str = "gpt-3.5-turbo";
 
 fn make_prompt(conversation: &Value) -> String {
     let secret = std::env::var("GPT_SECRET_KEY").unwrap();
+    let conversation: Vec<_> = conversation.as_array().unwrap()
+        .iter().filter(|&x| x["role"].as_str().unwrap() != Role::System.value()).collect();
     let body = serde_json::json!({
-        "model": "gpt-3.5-turbo",
-        "messages": conversation,
+        "model": CHAT_MODEL,
+        "messages": serde_json::json!(conversation.as_slice()),
         "stream": true
     }).to_string();
     return format!("POST /v1/chat/completions HTTP/1.1\r\nHost: api.openai.com\r\nContent-Length: {}\r\nContent-Type: application/json\r\nAuthorization: Bearer {secret}\r\n\r\n{}",
@@ -30,7 +37,10 @@ fn on_parse_header(data: &str, headers: &mut HashMap<String, String>) {
     if let Some(sep) = data.find(": ") {
         headers.insert(data[..sep].to_string(), data[sep+2..].to_string());
     } else {
-        //TODO: handle version, status-code, status-msg
+        let tokens: Vec<_> = data.splitn(3, " ").collect();
+        headers.insert("protocol".to_string(), tokens[0].to_string());
+        headers.insert("status".to_string(), tokens[1].to_string());
+        headers.insert("status-msg".to_string(), tokens[2].to_string());
     }
 }
 fn on_parse_body(data: &str) -> String {
@@ -55,6 +65,26 @@ fn on_parse_body(data: &str) -> String {
     }
 }
 
+enum Role {
+    User, System, AI
+}
+impl Role {
+    fn from(str: &str) -> Self {
+        match str.to_lowercase().as_str() {
+            "user" => Role::User,
+            "system" => Role::System,
+            "assistant" => Role::AI,
+            _ => panic!()
+        }
+    }
+    fn value(&self) -> &str {
+        match self {
+            Role::User => "user",
+            Role::System => "system",
+            Role::AI => "assistant",
+        }
+    }
+}
 struct State {
     conv: Value,
     input: String,
@@ -64,8 +94,11 @@ impl State {
     fn new() -> Self {
         State{ conv: serde_json::json!([]), input: String::new(), view_start: 0 }
     }
-    fn append_conv(&mut self, new_message: Value) {
-        self.conv.as_array_mut().unwrap().push(new_message)
+    fn append_conv(&mut self, role: Role, msg: &str) {
+        self.conv.as_array_mut().unwrap().push(serde_json::json!({
+            "role": role.value(),
+            "content": msg,
+        }));
     }
     fn pop_last(&mut self) -> Value {
         self.conv.as_array_mut().unwrap().pop().unwrap()
@@ -82,32 +115,42 @@ fn split_by_length(mut str: &str, length: usize) -> Vec<&str> {
     return result;
 }
 
-fn render_conversation(state: &mut State, stdout: &mut io::Stdout, height: u16, width: u16) -> io::Result<()>{
-    let mut cur_row = height-3;
+fn render_conversation(state: &mut State, stdout: &mut io::Stdout,
+                       row: u16, height: u16, width: u16) -> io::Result<()>{
+    let mut cur_row = row;
     let mut current_role = "";
     let conv = state.conv.as_array().unwrap().iter().rev();
-    let conv = conv.flat_map(|msg| {
-        msg["content"].as_str().unwrap().rsplit("\n")
-                      .flat_map(|x|  {
-                          let mut result = split_by_length(&x, width as usize);
-                          result.reverse();
-                          result
-                      })
-                      .map(|x| (msg["role"].as_str().unwrap(), x)).collect::<Vec<_>>()
+    let conv_iter = conv.flat_map(|msg| {
+        let content = msg["content"].as_str().unwrap();
+        let mut lines = content.rsplit("\n")
+               .flat_map(|x|  {
+                   let mut result = split_by_length(&x, width as usize);
+                   result.reverse();
+                   result
+               })
+               .map(|x| (false, msg["role"].as_str().unwrap(), x)).collect::<Vec<_>>();
+        lines.last_mut().unwrap().0 = true;
+        lines
     });
-    let count = conv.clone().count() as i32;
-    state.view_start = state.view_start.min((count - height as i32).max(0) as usize);
-    for (role, content) in conv.skip(state.view_start) {
+    let count = conv_iter.clone().count() as i32;
+    if count <= height as i32 {
+        state.view_start = 0;
+    } else if (count - state.view_start as i32) < (height as i32) {
+        state.view_start = (count - height as i32) as usize;
+    }
+    for (is_first, role, content) in conv_iter.skip(state.view_start) {
         if current_role != role { // NOTE: switch role or first line
             current_role = role;
-            stdout.queue(style::SetForegroundColor(if current_role == "user" {
-                USER_COLOR
-            } else {
-                AI_COLOR
+            stdout.queue(style::SetForegroundColor(match current_role {
+                "assistant" => AI_COLOR,
+                "user" => USER_COLOR,
+                "system" => SYSTEM_COLOR,
+                _ => panic!(),
             }))?;
         }
-        stdout.queue(cursor::MoveTo(0, cur_row))?
-              .queue(style::Print(content))?;
+        stdout.queue(cursor::MoveTo(0, cur_row))?;
+        if is_first { stdout.queue(style::Print(START_PREFIX))?; }
+        stdout.queue(style::Print(content))?;
         if cur_row == 0 { break; }
         cur_row -= 1;
     }
@@ -129,7 +172,7 @@ fn render_prompt(input: &String, stdout: &mut io::Stdout, row: u16) -> io::Resul
 
 fn render(state: &mut State, stdout: &mut io::Stdout, width: u16, height: u16) -> io::Result<()> {
     stdout.queue(terminal::Clear(ClearType::All))?;
-    render_conversation(state, stdout, height, width)?;
+    render_conversation(state, stdout, height-3, height - 2, width)?;
     render_seperator(stdout, height-2, width)?;
     render_prompt(&state.input, stdout, height-1)?;
     Ok(())
@@ -148,7 +191,7 @@ fn prompt(req: String, tx: Sender<String>) {
     let buffer: &mut [u8] = &mut [0; BUFFER_SIZE];
     let mut response: String = String::new();
     let mut index: usize = 0;
-    let mut headers = HashMap::new();
+    let mut headers: HashMap<String, String> = HashMap::new();
     let mut is_parsing_header = true;
     'outer: loop {
         match stream.read(buffer) {
@@ -161,6 +204,18 @@ fn prompt(req: String, tx: Sender<String>) {
                             if is_parsing_header { // NOTE: end of header
                                 index += i+2;
                                 is_parsing_header = false;
+                                if headers.get("status").unwrap() != "200" {
+                                    tx.send("[START] system".to_string()).unwrap();
+                                    let rest = &response[index+i..];
+                                    let msg = match serde_json::from_str::<Value>(rest) {
+                                        Ok(error) => error["error"]["message"].as_str().unwrap().to_string(),
+                                        Err(_err) => format!("Could not parse {rest}"),
+                                    };
+                                    tx.send(msg).unwrap();
+                                    break 'outer;
+                                } else {
+                                    tx.send("[START] assistant".to_string()).unwrap();
+                                }
                                 continue;
                             } else { // NOTE: end of body
                                 break 'outer;
@@ -176,17 +231,38 @@ fn prompt(req: String, tx: Sender<String>) {
                     } else { break; }
                 }
             }
-            Err(_err) => {
-                //TODO: println!("{err}");
+            Err(err) => {
+                tx.send("[START] system".to_string()).unwrap();
+                tx.send(err.to_string()).unwrap();
                 break;
             }
         }
     }
+    tx.send("[DONE]".to_string()).unwrap();
 }
+
+fn save_conversation(file_path: &str, conversation: &Value) {
+    let mut file = File::create(file_path).unwrap();
+    file.write_all(serde_json::to_string(conversation).unwrap().as_bytes()).unwrap();
+}
+
+fn load_conversation(file_path: &str) -> Result<Value, String> {
+    if let Ok(data) = std::fs::read(file_path) {
+        serde_json::from_slice(data.as_slice())
+            .map_err(|_err| format!("Could not parse file {file_path}"))
+    } else {
+        Err(format!("Could not read file {file_path}"))
+    }
+}
+
 fn main() -> io::Result<()> {
     terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
     let mut state = State::new();
+    match load_conversation(CONV_FILE) {
+        Ok(conv) => state.conv = conv,
+        Err(err) => {state.append_conv(Role::System, &err)}
+    }
     let (width, height) = terminal::size().unwrap();
     let (tx, rx) = mpsc::channel();
 
@@ -205,10 +281,8 @@ fn main() -> io::Result<()> {
                         }
                         KeyCode::Enter => {
                             if state.input.len() > 0 {
-                                state.append_conv(serde_json::json!({
-                                    "role": "user",
-                                    "content": state.input
-                                }));
+                                let input = state.input.clone();
+                                state.append_conv(Role::User, &input);
                                 state.input.clear();
                                 let req = make_prompt(&state.conv);
                                 let tx_c = tx.clone();
@@ -241,22 +315,18 @@ fn main() -> io::Result<()> {
         }
         match rx.try_recv() {
             Ok(mut content) => {
-                let on_ai_responding = state.pop_last();
-                let mut cur_content = "";
-                if on_ai_responding["role"] == "user" {
-                    state.append_conv(on_ai_responding);
+                if content == "[DONE]" {
+                    save_conversation(CONV_FILE, &state.conv);
+                } else if content.starts_with("[START] ") {
+                    let role = content.splitn(2, " ").skip(1).next().unwrap();
+                    state.append_conv(Role::from(role), "");
                 } else {
-                    cur_content = on_ai_responding["content"].as_str().unwrap_or("");
+                    let last = state.pop_last();
+                    content.insert_str(0, last["content"].as_str().unwrap_or(""));
+                    state.append_conv(Role::from(last["role"].as_str().unwrap()), &content);
                 }
-                content.insert_str(0, cur_content);
-                state.append_conv(serde_json::json!({
-                    "role": "assistant",
-                    "content": content,
-                }));
             }
-            Err(_err) => {
-                // TODO:
-            }
+            Err(_err) => {}
         }
         render(&mut state, &mut stdout, width, height)?;
         stdout.flush()?;
