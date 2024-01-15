@@ -1,14 +1,13 @@
 mod gpt;
-mod buffer;
-use buffer::Buffer;
+mod renderer;
+use renderer::Renderer;
 use std::fs::File;
 use std::io::{Write};
 use std::time::Duration;
 use std::sync::mpsc::{self};
 use std::{io::{self}, thread};
 use crossterm::{
-    QueueableCommand,
-    terminal, style, event::{self, KeyCode, KeyModifiers}, cursor
+    terminal, style, event::{self, KeyCode, KeyModifiers}
 };
 use serde::de::Visitor;
 
@@ -94,7 +93,7 @@ fn split_by_length(mut str: &str, length: usize) -> Vec<&str> {
     return result;
 }
 
-fn render_conversation(state: &mut State, buffer: &mut Buffer,
+fn render_conversation(state: &mut State, renderer: &mut Renderer,
                        row: usize, height: usize, width: usize) {
     let mut cur_row = row;
     let mut current_role = &Role::AI;
@@ -127,19 +126,19 @@ fn render_conversation(state: &mut State, buffer: &mut Buffer,
             }
         }
         if is_first {
-            buffer.render_line(cur_row, current_color, &format!("{START_PREFIX}{content}"));
+            renderer.render_line(cur_row, current_color, &format!("{START_PREFIX}{content}"));
         } else {
-            buffer.render_line(cur_row, current_color, content);
+            renderer.render_line(cur_row, current_color, content);
         };
         if cur_row == 0 { break; }
         cur_row -= 1;
     }
 }
 
-fn render(state: &mut State, buffer: &mut Buffer) -> io::Result<()> {
-    render_conversation(state, buffer, buffer.height-3, buffer.height - 2, buffer.width);
-    buffer.render_line(buffer.height-2, style::Color::Reset, &"—".repeat(buffer.width as usize));
-    buffer.render_line(buffer.height-1, INPUT_COLOR, &state.input);
+fn update(state: &mut State, renderer: &mut Renderer) -> io::Result<()> {
+    render_conversation(state, renderer, renderer.height-3, renderer.height - 2, renderer.width);
+    renderer.render_line(renderer.height-2, style::Color::Reset, &"—".repeat(renderer.width as usize));
+    renderer.render_line(renderer.height-1, INPUT_COLOR, &state.input);
     Ok(())
 }
 
@@ -160,7 +159,6 @@ fn load_conversation(file_path: &str) -> Result<Vec<(Role, String)>, String> {
 
 fn main() -> io::Result<()> {
     terminal::enable_raw_mode()?;
-    let mut stdout = io::stdout();
     let mut state = State::new();
     match load_conversation(CONV_FILE) {
         Ok(conv) => state.conv = conv,
@@ -169,16 +167,18 @@ fn main() -> io::Result<()> {
     let size = terminal::size().unwrap();
     let width = size.0 as usize;
     let height = size.1 as usize;
-    let mut buffers = [Buffer::new(width, height), Buffer::new(width, height)];
-    let mut rendering_buf = 0;
+    let mut renderer = Renderer::new(width, height);
     let (tx, rx) = mpsc::channel();
 
     // stdout.queue(crossterm::event::EnableMouseCapture).unwrap();
-    stdout.queue(terminal::Clear(terminal::ClearType::All)).unwrap();
+    renderer.clear()?;
     'main: loop {
-        buffers[rendering_buf].clear();
         while event::poll(Duration::ZERO)? {
             match event::read()? {
+                event::Event::Resize(w, h) => {
+                    renderer.resize(w as usize, h as usize);
+                    renderer.clear()?;
+                },
                 event::Event::Key(key) => {
                     match key.code {
                         KeyCode::Char(c) => {
@@ -251,13 +251,13 @@ fn main() -> io::Result<()> {
             Err(_err) => {}
         }
 
-        render(&mut state, &mut buffers[rendering_buf])?;
-        buffers[1-rendering_buf].render_diff(&buffers[rendering_buf], &mut stdout)?;
-        stdout.queue(cursor::MoveTo(state.input.len() as u16, height as u16 - 1))?;
-        stdout.flush()?;
-        thread::sleep(Duration::from_millis(1000/60));
+        update(&mut state, &mut renderer)?;
 
-        rendering_buf = 1 - rendering_buf;
+        renderer.render()?;
+        renderer.move_cursor(height as u16 - 1, state.input.len() as u16)?;
+        renderer.update()?;
+
+        thread::sleep(Duration::from_millis(1000/60));
     }
     terminal::disable_raw_mode()
 }
