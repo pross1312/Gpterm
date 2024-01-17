@@ -53,8 +53,8 @@ fn on_parse_body(data: &str) -> String {
 
 pub fn prompt(conv: &Value, tx: Sender<String>) {
     let req = make_prompt(conv);
-    let mut builder = SslConnector::builder(SslMethod::tls()).unwrap();
-    builder.set_ca_file("/etc/ssl/certs/ca-certificates.crt").unwrap();
+    let builder = SslConnector::builder(SslMethod::tls()).unwrap();
+    // builder.set_ca_file("/etc/ssl/certs/ca-certificates.crt").unwrap();
     let connector = builder.build();
     let stream = TcpStream::connect("api.openai.com:443").unwrap();
     TcpStream::set_read_timeout(&stream, Some(Duration::from_secs(10))).unwrap();
@@ -67,6 +67,7 @@ pub fn prompt(conv: &Value, tx: Sender<String>) {
     let mut index: usize = 0;
     let mut headers: HashMap<String, String> = HashMap::new();
     let mut is_parsing_header = true;
+
     'outer: loop {
         match stream.read(buffer) {
             Ok(n) => {
